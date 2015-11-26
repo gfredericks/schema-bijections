@@ -7,9 +7,9 @@
   [schema]
   (let [{:keys [left left->right right->left]}
         (schema->bijection schema
-                           (comp stringify-uuids
-                                 stringify-keys
-                                 camelize-keys))]
+                           [stringify-uuids
+                            stringify-keys
+                            camelize-keys])]
     {:json-schema left
      :to-json right->left
      :from-json left->right}))
@@ -43,16 +43,12 @@
 ;;
 
 (defn stringify-bigdecimals
-  [{:keys [left left->right right->left right] :as bijection}]
-  (if (= java.math.BigDecimal left)
+  [right]
+  (when (= java.math.BigDecimal right)
     {:left #"\d+(\.\d+)?M"
      :left->right (fn [s]
-                    (left->right
-                     (BigDecimal. (subs s 0 (dec (count s))))))
-     :right->left (fn [right-obj]
-                    (pr-str (right->left right-obj)))
-     :right right}
-    bijection))
+                    (BigDecimal. (subs s 0 (dec (count s)))))
+     :right->left pr-str}))
 
 
 (def my-schema
@@ -61,7 +57,7 @@
 
 (deftest custom-bijection-test
   (let [{:keys [left left->right right->left]}
-        (schema->bijection my-schema stringify-bigdecimals)
+        (schema->bijection my-schema [stringify-bigdecimals])
 
         my-value {:id #uuid "bcd82436-7962-4208-b460-853f5dd75d91"
                   :the-amount 42.9M}]

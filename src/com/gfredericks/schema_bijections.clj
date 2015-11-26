@@ -3,24 +3,6 @@
             [plumbing.core :refer [for-map map-from-keys map-keys]]
             [schema.core :as s]))
 
-;;
-;; Can we do schema bijections in steps, a bit like:
-;;
-;; (-> schema
-;;     identity-bijection
-;;     stringize-keys
-;;     camelize-keys
-;;     allow-key-keys
-;;     jsonize-scalars)
-;;
-
-
-;;
-;; So if we walked the schema once (postwalk?) and at each step we
-;; used a function that took the schema and returned a bijection...
-;; could that work?
-;;
-
 (defmacro throw-bijection-schema-error
   [data]
   `(throw (ex-info "Bijection schema error!"
@@ -65,44 +47,14 @@
 ;; return a bijection, and then we compose the bijections?
 ;;
 
-(defn transform-keys
-  "Transforms keys of map schemas in the left schema."
-  [func {:keys [left left->right right->left right] :as bijection}]
-  (if (and (non-record-map? left)
-           (every? keyword? (map s/explicit-schema-key (keys left))))
-    (let [bare-keys (map s/explicit-schema-key (keys left))
-          string->keyword (for-map [k bare-keys] (func k) k)
-          keyword->string (for-map [k bare-keys] k (func k))
-          left' (map-keys (fn [k]
-                            (if (keyword? k)
-                              (s/required-key (keyword->string k))
-                              (if (s/optional-key? k)
-                                (s/optional-key (keyword->string (:k k)))
-                                (throw (ex-info "Unknown key" {:k k})))))
-                          left)
-          left->right' (fn [left-obj]
-                         (left->right
-                          (map-keys (fn [k]
-                                      (get-or-throw string->keyword k))
-                                    left-obj)))
-          right->left' (fn [right-obj]
-                         (map-keys (fn [k]
-                                     (get-or-throw keyword->string k))
-                                   (right->left right-obj)))]
-      {:left left'
-       :left->right left->right'
-       :right->left right->left'
-       :right right})
-    bijection))
-
-(defn schema->bijection
+(defn schema->bijection*
   [schema bijector]
   (bijector
    (cond (non-record-map? schema)
          ;; TODO: support the rest-schema thing
          (let [key->bijection (for-map [[k v] schema]
                                 (s/explicit-schema-key k)
-                                (schema->bijection v bijector))]
+                                (schema->bijection* v bijector))]
            {:left (map-from-keys (comp :left key->bijection s/explicit-schema-key) (keys schema))
             :left->right (fn [left-obj]
                            (for-map [[k v] left-obj
@@ -117,14 +69,14 @@
             :right (map-from-keys (comp :right key->bijection s/explicit-schema-key) (keys schema))})
 
          (and (vector? schema) (= 1 (count schema)))
-         (let [{:keys [left left->right right->left right]} (schema->bijection (first schema) bijector)]
+         (let [{:keys [left left->right right->left right]} (schema->bijection* (first schema) bijector)]
            {:left [left]
             :left->right #(mapv left->right %)
             :right->left #(mapv right->left %)
             :right [right]})
 
          (instance? schema.core.Maybe schema)
-         (let [{:keys [left left->right right->left right]} (schema->bijection (:schema schema) bijector)]
+         (let [{:keys [left left->right right->left right]} (schema->bijection* (:schema schema) bijector)]
            {:left (s/maybe left)
             :left->right #(some-> % left->right)
             :right->left #(some-> % right->left)
@@ -133,30 +85,71 @@
          :else
          {:left schema, :left->right identity, :right->left identity, :right schema})))
 
+(defn transformers->bijector
+  [transformers]
+  (if-let [[tx & txs] (seq transformers)]
+    (let [bijector (transformers->bijector txs)]
+      (fn [bijection]
+        (let [{:keys [left left->right right->left right] :as bijection}
+              (bijector bijection)]
+          (if-let [{left' :left, left->right' :left->right, right->left' :right->left}
+                   (tx left)]
+            {:left left'
+             :left->right (comp left->right left->right')
+             :right->left (comp right->left' right->left)
+             :right right}
+            bijection))))
+    identity))
+
+(defn schema->bijection
+  [schema transformers]
+  (schema->bijection* schema (transformers->bijector transformers)))
+
+(defn transform-keys
+  "Transforms keys of map schemas in the left schema."
+  [func right]
+  (when (and (non-record-map? right)
+           (every? keyword? (map s/explicit-schema-key (keys right))))
+    (let [bare-keys (map s/explicit-schema-key (keys right))
+          string->keyword (for-map [k bare-keys] (func k) k)
+          keyword->string (for-map [k bare-keys] k (func k))
+          left (map-keys (fn [k]
+                            (if (keyword? k)
+                              (s/required-key (keyword->string k))
+                              (if (s/optional-key? k)
+                                (s/optional-key (keyword->string (:k k)))
+                                (throw (ex-info "Unknown key" {:k k})))))
+                          right)
+          left->right (fn [left-obj]
+                         (map-keys (fn [k]
+                                     (get-or-throw string->keyword k))
+                                   left-obj))
+          right->left (fn [right-obj]
+                         (map-keys (fn [k]
+                                     (get-or-throw keyword->string k))
+                                   right-obj))]
+      {:left left
+       :left->right left->right
+       :right->left right->left})))
+
 (defn stringify-uuids
   "Stringifys any UUIDs in the left schema."
-  [{:keys [left left->right right->left right] :as bijection}]
-  (if (= s/Uuid left)
-    {:left #"[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}"
-     :left->right #(left->right (java.util.UUID/fromString %))
-     :right->left #(str (right->left %))
-     :right right}
-    bijection))
+  [right]
+  (when (= s/Uuid right)
+    {:left #"^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$"
+     :left->right #(java.util.UUID/fromString %)
+     :right->left str}))
 
 (defn allow-extra-keys-on-left
   "Not technically a bijection anymore I guess."
-  [key-schema {:keys [left left->right right->left right] :as bijection}]
-  (if (and (non-record-map? left)
-           (not-any? #(satisfies? s/Schema %) (keys left)))
-    (let [left-keys (map s/explicit-schema-key (keys left))]
-      {:left (assoc left key-schema s/Any)
+  [key-schema right]
+  (when (and (non-record-map? right)
+           (not-any? #(satisfies? s/Schema %) (keys right)))
+    (let [right-keys (map s/explicit-schema-key (keys right))]
+      {:left (assoc right key-schema s/Any)
        :left->right (fn [left-obj]
-                      (-> left-obj
-                          (select-keys left-keys)
-                          (left->right)))
-       :right->left right->left
-       :right right})
-    bijection))
+                      (select-keys left-obj right-keys))
+       :right->left identity})))
 
 (def stringify-keys (partial transform-keys name))
 (def camelize-keys (partial transform-keys csk/->camelCase))
@@ -201,20 +194,16 @@
 #_#_
 (defn stringify-joda-date-times
   "Stringifies any DateTimes in the left schema."
-  [{:keys [left left->right right->left right] :as bijection}]
-  (if (= org.joda.time.DateTime left)
+  [right]
+  (when (= org.joda.time.DateTime left)
     {:left #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{3}Z"
-     :left->right #(left->right (clj-time.format/parse %))
-     :right->left #(str (right->left %))
-     :right right}
-    bijection))
+     :left->right clj-time.format/parse
+     :right->left str}))
 
 (defn stringify-joda-local-dates
   "Stringifies any LocalDates in the left schema."
-  [{:keys [left left->right right->left right] :as bijection}]
-  (if (= org.joda.time.LocalDate left)
+  [right]
+  (when (= org.joda.time.LocalDate right)
     {:left #"\d{4}-\d{2}-\d{2}"
-     :left->right #(left->right (clj-time.format/parse-local-date %))
-     :right->left #(str (right->left %))
-     :right right}
-    bijection))
+     :left->right clj-time.format/parse-local-date
+     :right->left str}))
