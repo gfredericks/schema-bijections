@@ -57,11 +57,13 @@
 
 (deftest custom-bijection-test
   (let [{:keys [left left->right right->left]}
-        (schema->bijection my-schema [stringify-bigdecimals])
+        (schema->bijection my-schema [stringify-bigdecimals
+                                      stringify-keys])
 
         my-value {:id #uuid "bcd82436-7962-4208-b460-853f5dd75d91"
                   :the-amount 42.9M}]
     (is (s/validate my-schema my-value))
     (is (= (right->left my-value)
-           (assoc my-value :the-amount "42.9M")))
+           {"id" #uuid "bcd82436-7962-4208-b460-853f5dd75d91"
+            "the-amount" "42.9M"}))
     (is (= my-value (-> my-value right->left left->right)))))
