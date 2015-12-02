@@ -4,7 +4,9 @@ A first draft of a library for bijecting prismatic schemas.
 
 ## Obtention
 
-Not yet.
+```
+[com.gfredericks/schema-bijections "0.1.0"]
+```
 
 ## Rationale
 
