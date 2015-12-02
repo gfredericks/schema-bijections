@@ -101,94 +101,6 @@
 
 (prefer-method walk* clojure.lang.IRecord clojure.lang.IPersistentMap)
 
-(defn walk
-  [schema bijector]
-  (bijector (walk* schema bijector)))
-
-(defn transformers->bijector
-  [transformers]
-  (if-let [[tx & txs] (seq transformers)]
-    (let [bijector (transformers->bijector txs)]
-      (fn [bijection]
-        (let [{:keys [left left->right right->left right] :as bijection}
-              (bijector bijection)]
-          (if-let [{left' :left, left->right' :left->right, right->left' :right->left}
-                   (tx left)]
-            {:left left'
-             :left->right (comp left->right left->right')
-             :right->left (comp right->left' right->left)
-             :right right}
-            bijection))))
-    identity))
-
-(defn schema->bijection
-  [schema transformers]
-  (walk schema (transformers->bijector transformers)))
-
-(defn non-record-map?
-  [m]
-  (and (map? m) (not (record? m))))
-
-;; TODO: how should the rest schema play with this?
-(defn transform-keys
-  "Transforms keys of map schemas in the left schema."
-  [func right]
-  (when (and (non-record-map? right)
-             (every? keyword? (map s/explicit-schema-key (keys right))))
-    (let [bare-keys (map s/explicit-schema-key (keys right))
-          string->keyword (for-map [k bare-keys] (func k) k)
-          keyword->string (for-map [k bare-keys] k (func k))
-          _ (when (not= (count string->keyword)
-                        (count keyword->string))
-              (throw (ex-info "Collision in transform-keys function!"
-                              {:schema right
-                               :func func
-                               :colliding-keys (->> bare-keys
-                                                    (group-by func)
-                                                    (vals)
-                                                    (filter #(< 1 (count %)))
-                                                    (first))
-                               :type ::bad-input})))
-          left (map-keys (fn [k]
-                            (if (keyword? k)
-                              (s/required-key (keyword->string k))
-                              (if (s/optional-key? k)
-                                (s/optional-key (keyword->string (:k k)))
-                                (throw (ex-info "Unknown key" {:k k})))))
-                          right)
-          left->right (fn [left-obj]
-                         (map-keys (fn [k]
-                                     (get-or-throw string->keyword k))
-                                   left-obj))
-          right->left (fn [right-obj]
-                         (map-keys (fn [k]
-                                     (get-or-throw keyword->string k))
-                                   right-obj))]
-      {:left left
-       :left->right left->right
-       :right->left right->left})))
-
-(defn stringify-uuids
-  "Stringifys any UUIDs in the left schema."
-  [right]
-  (when (= s/Uuid right)
-    {:left #"^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$"
-     :left->right #(java.util.UUID/fromString %)
-     :right->left str}))
-
-(defn allow-extra-keys-on-left
-  "Not technically a bijection anymore I guess."
-  [key-schema right]
-  (when (and (non-record-map? right)
-             (not-any? #(satisfies? s/Schema %) (keys right)))
-    (let [right-keys (map s/explicit-schema-key (keys right))]
-      {:left (assoc right key-schema s/Any)
-       :left->right (fn [left-obj]
-                      (select-keys left-obj right-keys))
-       :right->left identity})))
-
-(def stringify-keys (partial transform-keys name))
-
 (defn wrap-top-level-errors
   [{:keys [left left->right right->left right]}]
   {:left left
@@ -221,6 +133,102 @@
                                    :data right-obj}
                                   t))))))
    :right right})
+
+(defn walk
+  [schema bijector]
+  (bijector (walk* schema bijector)))
+
+(defn transformers->bijector
+  [transformers]
+  (if-let [[tx & txs] (seq transformers)]
+    (let [bijector (transformers->bijector txs)]
+      (fn [bijection]
+        (let [{:keys [left left->right right->left right] :as bijection}
+              (bijector bijection)]
+          (if-let [{left' :left, left->right' :left->right, right->left' :right->left}
+                   (tx left)]
+            {:left left'
+             :left->right (comp left->right left->right')
+             :right->left (comp right->left' right->left)
+             :right right}
+            bijection))))
+    identity))
+
+(defn schema->bijection
+  [schema transformers]
+  (wrap-top-level-errors
+   (walk schema (transformers->bijector transformers))))
+
+(defn non-record-map?
+  [m]
+  (and (map? m) (not (record? m))))
+
+;; TODO: how should the rest schema play with this?
+(defn transform-keys
+  "Transforms keys of map schemas in the left schema."
+  [func right]
+  (when (non-record-map? right)
+    (assert (not-any? #(satisfies? schema.core/Schema %) (keys right))
+            "General map schemas not supported yet!")
+    (let [bare-keys (map s/explicit-schema-key (keys right))
+          fk->k (for-map [k bare-keys] (func k) k)
+          k->fk (for-map [k bare-keys] k (func k))
+          _ (when (not= (count fk->k)
+                        (count k->fk))
+              (throw (ex-info "Collision in transform-keys function!"
+                              {:schema right
+                               :func func
+                               :colliding-keys (->> bare-keys
+                                                    (group-by func)
+                                                    (vals)
+                                                    (filter #(< 1 (count %)))
+                                                    (first))
+                               :type ::bad-input})))
+          left (map-keys (fn [k]
+                            (cond (keyword? k)
+                                  (s/required-key (k->fk k))
+
+                                  (s/optional-key? k)
+                                  (s/optional-key (k->fk (:k k)))
+
+                                  (s/required-key? k)
+                                  (s/required-key (k->fk (:k k)))
+
+                                  :else
+                                  (throw (ex-info "Unknown key" {:k k}))))
+                          right)
+          left->right (fn [left-obj]
+                         (map-keys (fn [k]
+                                     (get-or-throw fk->k k))
+                                   left-obj))
+          right->left (fn [right-obj]
+                         (map-keys (fn [k]
+                                     (get-or-throw k->fk k))
+                                   right-obj))]
+      {:left left
+       :left->right left->right
+       :right->left right->left})))
+
+(defn stringify-uuids
+  "Stringifys any UUIDs in the left schema."
+  [right]
+  (when (= s/Uuid right)
+    {:left #"^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$"
+     :left->right #(java.util.UUID/fromString %)
+     :right->left str}))
+
+(defn allow-extra-keys-on-left
+  "Not technically a bijection anymore I guess."
+  [key-schema right]
+  (when (and (non-record-map? right)
+             (not-any? #(satisfies? s/Schema %) (keys right)))
+    (let [right-keys (map s/explicit-schema-key (keys right))]
+      {:left (assoc right key-schema s/Any)
+       :left->right (fn [left-obj]
+                      (select-keys left-obj right-keys))
+       :right->left identity})))
+
+(def stringify-keys (partial transform-keys name))
 
 ;;
 ;; Library types

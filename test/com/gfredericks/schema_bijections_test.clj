@@ -45,6 +45,33 @@
        "thomas" "heyo"
        "comments" [{"text" "hiya"} {"text" "it is"}]})))
 
+(deftest collision-exception-test
+  (is (thrown? clojure.lang.ExceptionInfo
+               (jsonify-schema {:foo s/Int (s/required-key "foo") s/Uuid}))))
+
+(deftest top-level-errors-test
+  (let [my-schema [{:name s/Str
+                    :comments [{:created-at s/Int
+                                :text s/Str}]}]
+        {:keys [from-json to-json]} (jsonify-schema my-schema)
+
+        from-ex (try (to-json [{:name "Joe"
+                                :comments [{:created-at 19
+                                            :text "Somebody is wrong on the internet."}
+                                           {:created-ats 42
+                                            :text "Welp I don't know"}]}])
+                     (is false "to-json didn't throw!")
+                     (catch Exception e e))
+        to-ex  (try (from-json [{"name" "Joe"
+                                 "comments" [{:created-at 19
+                                              "text" "Somebody is wrong on the internet."}
+                                             {"createdAt" 42
+                                              "text" "Here goes nothing"}]}])
+                    (is false "to-json didn't throw!")
+                    (catch Exception e e))]
+    (is (re-find #"created-at missing-required-key" (pr-str from-ex)))
+    (is (re-find #"\"createdAt\" missing-required-key" (pr-str to-ex)))))
+
 ;;
 ;; Custom bijections
 ;;
