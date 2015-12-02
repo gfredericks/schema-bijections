@@ -3,6 +3,8 @@
   :url "https://github.com/gfredericks/schema-bijections"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
-  :dependencies [[camel-snake-kebab "0.3.2"]
-                 [org.clojure/clojure "1.7.0"]
-                 [prismatic/plumbing "0.5.2"]])
+  :dependencies [[org.clojure/clojure "1.7.0"]
+                 [prismatic/schema "1.0.3"]
+                 [prismatic/plumbing "0.5.2"]]
+  :profiles {:dev {:dependencies [[camel-snake-kebab "0.3.2"]
+                                  [org.clojure/test.check "0.9.0"]]}})

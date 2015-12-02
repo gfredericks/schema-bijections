@@ -1,7 +1,14 @@
 (ns com.gfredericks.schema-bijections-test
-  (:require [clojure.test :refer :all]
-            [com.gfredericks.schema-bijections :refer :all]
-            [schema.core :as s]))
+  (:require [camel-snake-kebab.core :as csk]
+            [clojure.test :refer :all]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]
+            [clojure.test.check.clojure-test :refer [defspec]]
+            [com.gfredericks.schema-bijections :as sb :refer :all]
+            [schema.core :as s]
+            [schema.experimental.generators :as sgen]))
+
+(def camelize-keys (partial transform-keys csk/->camelCase))
 
 (defn jsonify-schema
   [schema]
@@ -67,3 +74,58 @@
            {"id" #uuid "bcd82436-7962-4208-b460-853f5dd75d91"
             "the-amount" "42.9M"}))
     (is (= my-value (-> my-value right->left left->right)))))
+
+
+;;
+;; Properties
+;;
+
+(def gen-leaf-schema
+  (gen/one-of [(gen/elements [s/Int
+                              Double
+                              Long
+                              s/Str
+                              s/Uuid
+                              s/Bool])]))
+
+(def gen-schema
+  ;; have to scale this since recursive-gen's sizing is still out of control
+  (gen/scale #(min % 15)
+             (gen/recursive-gen (fn [inner-gen]
+                                  (gen/one-of [ ;; TODO: fancier sequence schemas
+                                               (gen/let [schema inner-gen]
+                                                 [schema])
+                                               ;; TODO: fancier map schemas
+                                               (gen/map gen/keyword inner-gen)
+
+                                               (gen/let [schema inner-gen]
+                                                 (s/maybe schema))]))
+                                gen-leaf-schema)))
+
+(def gen-transformers
+  (gen/vector-distinct
+   (gen/elements [stringify-uuids
+                  stringify-keys
+                  stringify-bigdecimals
+                  camelize-keys])))
+
+(def roundtrip-scenario
+  (gen/such-that
+   (fn [{:keys [schema transformers]}]
+     (try (schema->bijection schema transformers)
+          (catch clojure.lang.ExceptionInfo e
+            (when-not (= ::sb/bad-input (:type (ex-data e)))
+              (throw e)))))
+   (gen/let [[schema transformers] (gen/tuple gen-schema
+                                              gen-transformers)
+             x (gen/scale #(min % 15) (sgen/generator schema))]
+     {:schema schema :transformers transformers :x x})))
+
+(defspec roundtrip-spec
+  (prop/for-all [{:keys [schema transformers x]}
+                 roundtrip-scenario]
+    (let [{:keys [left left->right right->left]}
+          (schema->bijection schema transformers)]
+      (s/validate schema x)
+      (s/validate left (right->left x))
+      (= x (-> x right->left left->right)))))

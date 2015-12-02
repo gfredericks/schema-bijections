@@ -1,6 +1,5 @@
 (ns com.gfredericks.schema-bijections
-  (:require [camel-snake-kebab.core :as csk]
-            [plumbing.core :refer [for-map map-from-keys map-keys]]
+  (:require [plumbing.core :refer [for-map map-from-keys map-keys]]
             [schema.core :as s]))
 
 (defmacro throw-bijection-schema-error
@@ -14,10 +13,6 @@
   (if-let [[_ v] (find m k)]
     v
     (throw-bijection-schema-error k)))
-
-(defn ^:private non-record-map?
-  [x]
-  (and (map? x) (not (record? x))))
 
 (def Schema "A schema schema" (s/protocol s/Schema))
 (def Bijection
@@ -42,48 +37,73 @@
         (s/required-key? k) (s/required-key (f (:k k)))
         :else (throw (ex-info "WTF?" {:k k}))))
 
-;;
-;; Is there a way to do this where these functions take a schema and
-;; return a bijection, and then we compose the bijections?
-;;
+(declare walk)
 
-(defn schema->bijection*
+(defmulti walk* (fn [schema bijector] (type schema)))
+
+(defmethod walk* clojure.lang.IPersistentMap
   [schema bijector]
-  (bijector
-   (cond (non-record-map? schema)
-         ;; TODO: support the rest-schema thing
-         (let [key->bijection (for-map [[k v] schema]
-                                (s/explicit-schema-key k)
-                                (schema->bijection* v bijector))]
-           {:left (map-from-keys (comp :left key->bijection s/explicit-schema-key) (keys schema))
-            :left->right (fn [left-obj]
-                           (for-map [[k v] left-obj
-                                     :let [{:keys [left->right]} (or (get key->bijection k)
-                                                                     (throw-bijection-schema-error left-obj))]]
-                             k (left->right v)))
-            :right->left (fn [right-obj]
-                           (for-map [[k v] right-obj
-                                     :let [{:keys [right->left]} (or (get key->bijection k)
-                                                                     (throw-bijection-schema-error right-obj))]]
-                             k (right->left v)))
-            :right (map-from-keys (comp :right key->bijection s/explicit-schema-key) (keys schema))})
+  ;; if this is ever a problem the solution is probably to create a
+  ;; special walk* impl? I'm not sure why it would come up though.
+  (assert (not (instance? clojure.lang.IRecord schema))
+          "Cannot walk* records!")
 
-         (and (vector? schema) (= 1 (count schema)))
-         (let [{:keys [left left->right right->left right]} (schema->bijection* (first schema) bijector)]
-           {:left [left]
-            :left->right #(mapv left->right %)
-            :right->left #(mapv right->left %)
-            :right [right]})
 
-         (instance? schema.core.Maybe schema)
-         (let [{:keys [left left->right right->left right]} (schema->bijection* (:schema schema) bijector)]
-           {:left (s/maybe left)
-            :left->right #(some-> % left->right)
-            :right->left #(some-> % right->left)
-            :right (s/maybe right)})
+  (let [key->bijection (for-map [[k v] schema]
+                         (s/explicit-schema-key k)
+                         (walk v bijector))]
+    {:left (map-from-keys (comp :left key->bijection s/explicit-schema-key) (keys schema))
+     :left->right (fn [left-obj]
+                    (for-map [[k v] left-obj
+                              :let [{:keys [left->right]} (or (get key->bijection k)
+                                                              (throw-bijection-schema-error left-obj))]]
+                      k (left->right v)))
+     :right->left (fn [right-obj]
+                    (for-map [[k v] right-obj
+                              :let [{:keys [right->left]} (or (get key->bijection k)
+                                                              (throw-bijection-schema-error right-obj))]]
+                      k (right->left v)))
+     :right (map-from-keys (comp :right key->bijection s/explicit-schema-key) (keys schema))}))
 
-         :else
-         {:left schema, :left->right identity, :right->left identity, :right schema})))
+(defmethod walk* clojure.lang.IPersistentVector
+  [schema bijector]
+  (assert (and (= 1 (count schema))
+               (satisfies? schema.core/Schema (first schema))
+               (not (instance? schema.core.One (first schema))))
+          "General sequence schemas not implemented yet!")
+  (let [{:keys [left left->right right->left right]} (walk (first schema) bijector)]
+    {:left [left]
+     :left->right #(mapv left->right %)
+     :right->left #(mapv right->left %)
+     :right [right]}))
+
+(defmethod walk* schema.core.Maybe
+  [schema bijector]
+  (let [{:keys [left left->right right->left right]} (walk (:schema schema) bijector)]
+    {:left (s/maybe left)
+     :left->right #(some-> % left->right)
+     :right->left #(some-> % right->left)
+     :right (s/maybe right)}))
+
+(defmethod walk* clojure.lang.IRecord
+  [schema bijector]
+  {:left schema
+   :left->right identity
+   :right->left identity
+   :right schema})
+
+(defmethod walk* :default
+  [schema bijector]
+  {:left schema
+   :left->right identity
+   :right->left identity
+   :right schema})
+
+(prefer-method walk* clojure.lang.IRecord clojure.lang.IPersistentMap)
+
+(defn walk
+  [schema bijector]
+  (bijector (walk* schema bijector)))
 
 (defn transformers->bijector
   [transformers]
@@ -103,16 +123,32 @@
 
 (defn schema->bijection
   [schema transformers]
-  (schema->bijection* schema (transformers->bijector transformers)))
+  (walk schema (transformers->bijector transformers)))
 
+(defn non-record-map?
+  [m]
+  (and (map? m) (not (record? m))))
+
+;; TODO: how should the rest schema play with this?
 (defn transform-keys
   "Transforms keys of map schemas in the left schema."
   [func right]
   (when (and (non-record-map? right)
-           (every? keyword? (map s/explicit-schema-key (keys right))))
+             (every? keyword? (map s/explicit-schema-key (keys right))))
     (let [bare-keys (map s/explicit-schema-key (keys right))
           string->keyword (for-map [k bare-keys] (func k) k)
           keyword->string (for-map [k bare-keys] k (func k))
+          _ (when (not= (count string->keyword)
+                        (count keyword->string))
+              (throw (ex-info "Collision in transform-keys function!"
+                              {:schema right
+                               :func func
+                               :colliding-keys (->> bare-keys
+                                                    (group-by func)
+                                                    (vals)
+                                                    (filter #(< 1 (count %)))
+                                                    (first))
+                               :type ::bad-input})))
           left (map-keys (fn [k]
                             (if (keyword? k)
                               (s/required-key (keyword->string k))
@@ -144,7 +180,7 @@
   "Not technically a bijection anymore I guess."
   [key-schema right]
   (when (and (non-record-map? right)
-           (not-any? #(satisfies? s/Schema %) (keys right)))
+             (not-any? #(satisfies? s/Schema %) (keys right)))
     (let [right-keys (map s/explicit-schema-key (keys right))]
       {:left (assoc right key-schema s/Any)
        :left->right (fn [left-obj]
@@ -152,7 +188,6 @@
        :right->left identity})))
 
 (def stringify-keys (partial transform-keys name))
-(def camelize-keys (partial transform-keys csk/->camelCase))
 
 (defn wrap-top-level-errors
   [{:keys [left left->right right->left right]}]
