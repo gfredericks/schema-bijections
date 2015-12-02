@@ -8,7 +8,7 @@
             [schema.core :as s]
             [schema.experimental.generators :as sgen]))
 
-(def camelize-keys (partial transform-keys csk/->camelCase))
+(def camelize-keys (transform-keys csk/->camelCase))
 
 (defn jsonify-schema
   [schema]

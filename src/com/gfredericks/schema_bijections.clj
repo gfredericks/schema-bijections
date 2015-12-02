@@ -2,34 +2,19 @@
   (:require [plumbing.core :refer [for-map map-from-keys map-keys]]
             [schema.core :as s]))
 
-(defmacro throw-bijection-schema-error
+(defmacro ^:private throw-bijection-schema-error
   [data]
   `(throw (ex-info "Bijection schema error!"
                    {:type ::bijection-schema-error
                     :data ~data})))
 
-(defn get-or-throw
+(defn ^:private get-or-throw
   [m k]
   (if-let [[_ v] (find m k)]
     v
     (throw-bijection-schema-error k)))
 
-(def Schema "A schema schema" (s/protocol s/Schema))
-(def Bijection
-  {:left Schema
-   :left->right (s/=> s/Any s/Any)
-   :right->left (s/=> s/Any s/Any)
-   :right Schema})
-
-(s/defn ->bijection :- Bijection
-  "Given a schema, returns the identity bijection."
-  [schema :- Schema]
-  {:left schema
-   :left->right identity
-   :right->left identity
-   :right schema})
-
-(defn key-fmap
+(defn ^:private key-fmap
   [f k]
   ;; MONADS!
   (cond (keyword? k) (f k)
@@ -39,15 +24,20 @@
 
 (declare walk)
 
-(defmulti walk* (fn [schema bijector] (type schema)))
+(defmulti walk*
+  "Multimethod that walks a schema with a bijector. Should call walk
+  instead of direct recursion.
+
+  It should only be necessary to extend this multimethod to support
+  new composite schemas."
+  (fn [schema bijector] (type schema)))
 
 (defmethod walk* clojure.lang.IPersistentMap
   [schema bijector]
   ;; if this is ever a problem the solution is probably to create a
   ;; special walk* impl? I'm not sure why it would come up though.
   (assert (not (instance? clojure.lang.IRecord schema))
-          "Cannot walk* records!")
-
+          "Cannot walk records!")
 
   (let [key->bijection (for-map [[k v] schema]
                          (s/explicit-schema-key k)
@@ -85,6 +75,9 @@
      :right->left #(some-> % right->left)
      :right (s/maybe right)}))
 
+;; This is the same as the :default impl, but we need it here to avoid
+;; all the random schema defrecords getting sucked into the
+;; IPersistentMap impl.
 (defmethod walk* clojure.lang.IRecord
   [schema bijector]
   {:left schema
@@ -101,7 +94,7 @@
 
 (prefer-method walk* clojure.lang.IRecord clojure.lang.IPersistentMap)
 
-(defn wrap-top-level-errors
+(defn ^:private wrap-top-level-errors
   [{:keys [left left->right right->left right]}]
   {:left left
    :left->right (fn [left-obj]
@@ -134,12 +127,13 @@
                                   t))))))
    :right right})
 
-(defn walk
+(defn ^:private walk
   [schema bijector]
   (bijector (walk* schema bijector)))
 
-(defn transformers->bijector
+(defn ^:private transformers->bijector
   [transformers]
+  ;; I feel like I'm overcomplicating something.
   (if-let [[tx & txs] (seq transformers)]
     (let [bijector (transformers->bijector txs)]
       (fn [bijection]
@@ -155,62 +149,80 @@
     identity))
 
 (defn schema->bijection
+  ;; I think I need some more intuitive terminology/concepts.
+  "Given a schema and a sequence of transformers, returns a bijection.
+
+  A transformer is a function from a schema to nil (when the schema is
+  not the sort that the transformer intends to transform) or a map:
+    :left         the transformed schema
+    :left->right  a function that converts values from the transformed
+                  schema to the input schema
+    :right->left  a function that converts values from the input schema
+                  to the transformed schema
+
+  A bijection is the same as the map returned from a transformer."
   [schema transformers]
   (wrap-top-level-errors
    (walk schema (transformers->bijector transformers))))
 
-(defn non-record-map?
+;;
+;; The builtin transformers
+;;
+
+(defn ^:private non-record-map?
   [m]
   (and (map? m) (not (record? m))))
 
 ;; TODO: how should the rest schema play with this?
 (defn transform-keys
-  "Transforms keys of map schemas in the left schema."
-  [func right]
-  (when (non-record-map? right)
-    (assert (not-any? #(satisfies? schema.core/Schema %) (keys right))
-            "General map schemas not supported yet!")
-    (let [bare-keys (map s/explicit-schema-key (keys right))
-          fk->k (for-map [k bare-keys] (func k) k)
-          k->fk (for-map [k bare-keys] k (func k))
-          _ (when (not= (count fk->k)
-                        (count k->fk))
-              (throw (ex-info "Collision in transform-keys function!"
-                              {:schema right
-                               :func func
-                               :colliding-keys (->> bare-keys
-                                                    (group-by func)
-                                                    (vals)
-                                                    (filter #(< 1 (count %)))
-                                                    (first))
-                               :type ::bad-input})))
-          left (map-keys (fn [k]
-                            (cond (keyword? k)
-                                  (s/required-key (k->fk k))
+  "Given a function for transforming map keys, returns a transformer
+  that transforms keys of map schemas."
+  [func]
+  (fn [right]
+    (when (non-record-map? right)
+      (assert (not-any? #(satisfies? schema.core/Schema %) (keys right))
+              "General map schemas not supported yet!")
+      (let [bare-keys (map s/explicit-schema-key (keys right))
+            fk->k (for-map [k bare-keys] (func k) k)
+            k->fk (for-map [k bare-keys] k (func k))
+            _ (when (not= (count fk->k)
+                          (count k->fk))
+                (throw (ex-info "Collision in transform-keys function!"
+                                {:schema right
+                                 :func func
+                                 :colliding-keys (->> bare-keys
+                                                      (group-by func)
+                                                      (vals)
+                                                      (filter #(< 1 (count %)))
+                                                      (first))
+                                 :type ::bad-input})))
+            left (map-keys (fn [k]
+                             (cond (keyword? k)
+                                   (s/required-key (k->fk k))
 
-                                  (s/optional-key? k)
-                                  (s/optional-key (k->fk (:k k)))
+                                   (s/optional-key? k)
+                                   (s/optional-key (k->fk (:k k)))
 
-                                  (s/required-key? k)
-                                  (s/required-key (k->fk (:k k)))
+                                   (s/required-key? k)
+                                   (s/required-key (k->fk (:k k)))
 
-                                  :else
-                                  (throw (ex-info "Unknown key" {:k k}))))
-                          right)
-          left->right (fn [left-obj]
-                         (map-keys (fn [k]
-                                     (get-or-throw fk->k k))
-                                   left-obj))
-          right->left (fn [right-obj]
-                         (map-keys (fn [k]
-                                     (get-or-throw k->fk k))
-                                   right-obj))]
-      {:left left
-       :left->right left->right
-       :right->left right->left})))
+                                   :else
+                                   (throw (ex-info "Unknown key" {:k k}))))
+                           right)
+            left->right (fn [left-obj]
+                          (map-keys (fn [k]
+                                      (get-or-throw fk->k k))
+                                    left-obj))
+            right->left (fn [right-obj]
+                          (map-keys (fn [k]
+                                      (get-or-throw k->fk k))
+                                    right-obj))]
+        {:left left
+         :left->right left->right
+         :right->left right->left}))))
 
 (defn stringify-uuids
-  "Stringifys any UUIDs in the left schema."
+  "A transformer that stringifys UUID schemas."
   [right]
   (when (= s/Uuid right)
     {:left #"^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$"
@@ -228,25 +240,6 @@
                       (select-keys left-obj right-keys))
        :right->left identity})))
 
-(def stringify-keys (partial transform-keys name))
-
-;;
-;; Library types
-;;
-
-#_#_
-(defn stringify-joda-date-times
-  "Stringifies any DateTimes in the left schema."
-  [right]
-  (when (= org.joda.time.DateTime left)
-    {:left #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{3}Z"
-     :left->right clj-time.format/parse
-     :right->left str}))
-
-(defn stringify-joda-local-dates
-  "Stringifies any LocalDates in the left schema."
-  [right]
-  (when (= org.joda.time.LocalDate right)
-    {:left #"\d{4}-\d{2}-\d{2}"
-     :left->right clj-time.format/parse-local-date
-     :right->left str}))
+(def stringify-keys
+  "A transformer that converts keyword keys of maps into string keys."
+  (transform-keys name))
