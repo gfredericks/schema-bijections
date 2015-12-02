@@ -21,8 +21,8 @@ match the schema. I had quickly figured out how to use coercers to
 solve all of the problems mentioned above, but I quickly noticed some
 drawbacks.
 
-My primary use case was for specifying a JSON HTTP API. I would use
-schemas to describe the input and output data structures, in their
+My primary use case was for specifying a JSON HTTP API. I used schemas
+to describe the input and output data structures, in their
 clojure-fluent form. Among the drawbacks:
 
 - Coercers only helped for coercing the input, not the output. For
