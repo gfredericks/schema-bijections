@@ -108,22 +108,30 @@
 ;;
 
 (def gen-leaf-schema
-  (gen/one-of [(gen/elements [s/Int
+  (gen/one-of [(gen/elements [s/Bool
+                              s/Int
                               Double
                               Long
                               s/Str
-                              s/Uuid
-                              s/Bool])]))
+                              s/Uuid])]))
 
 (def gen-schema
   ;; have to scale this since recursive-gen's sizing is still out of control
   (gen/scale #(min % 15)
              (gen/recursive-gen (fn [inner-gen]
-                                  (gen/one-of [ ;; TODO: fancier sequence schemas
+                                  (gen/one-of [;; TODO: fancier sequence schemas
                                                (gen/let [schema inner-gen]
                                                  [schema])
-                                               ;; TODO: fancier map schemas
-                                               (gen/map gen/keyword inner-gen)
+                                               (gen/let [static-keys
+                                                         (gen/map gen/keyword inner-gen)
+
+                                                         dynamic-keys
+                                                         (gen/one-of
+                                                          [(gen/return nil)
+                                                           (gen/tuple inner-gen inner-gen)])]
+                                                 (cond-> static-keys
+                                                   dynamic-keys
+                                                   (conj dynamic-keys)))
 
                                                (gen/let [schema inner-gen]
                                                  (s/maybe schema))]))
@@ -141,7 +149,8 @@
    (fn [{:keys [schema transformers]}]
      (try (schema->bijection schema transformers)
           (catch clojure.lang.ExceptionInfo e
-            (when-not (= ::sb/bad-input (:type (ex-data e)))
+            (when-not (or (= ::sb/bad-input (:type (ex-data e)))
+                          (= ::sb/bad-input (:type (ex-data (.getCause e)))))
               (throw e)))))
    (gen/let [[schema transformers] (gen/tuple gen-schema
                                               gen-transformers)

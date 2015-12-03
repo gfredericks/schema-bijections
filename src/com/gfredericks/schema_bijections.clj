@@ -2,17 +2,13 @@
   (:require [plumbing.core :refer [for-map map-from-keys map-keys]]
             [schema.core :as s]))
 
+(def ^:private schema? #(satisfies? s/Schema %))
+
 (defmacro ^:private throw-bijection-schema-error
   [data]
   `(throw (ex-info "Bijection schema error!"
                    {:type ::bijection-schema-error
                     :data ~data})))
-
-(defn ^:private get-or-throw
-  [m k]
-  (if-let [[_ v] (find m k)]
-    v
-    (throw-bijection-schema-error k)))
 
 (defn ^:private key-fmap
   [f k]
@@ -39,21 +35,61 @@
   (assert (not (instance? clojure.lang.IRecord schema))
           "Cannot walk records!")
 
-  (let [key->bijection (for-map [[k v] schema]
-                         (s/explicit-schema-key k)
-                         (walk v bijector))]
-    {:left (map-from-keys (comp :left key->bijection s/explicit-schema-key) (keys schema))
-     :left->right (fn [left-obj]
-                    (for-map [[k v] left-obj
-                              :let [{:keys [left->right]} (or (get key->bijection k)
-                                                              (throw-bijection-schema-error left-obj))]]
-                      k (left->right v)))
-     :right->left (fn [right-obj]
-                    (for-map [[k v] right-obj
-                              :let [{:keys [right->left]} (or (get key->bijection k)
-                                                              (throw-bijection-schema-error right-obj))]]
-                      k (right->left v)))
-     :right (map-from-keys (comp :right key->bijection s/explicit-schema-key) (keys schema))}))
+  (letfn [(walk-map-with-no-key-schemas
+            [schema]
+            (let [key->bijection (for-map [[k v] schema]
+                                   (s/explicit-schema-key k)
+                                   (walk v bijector))]
+              {:left (with-meta (map-from-keys (comp :left key->bijection s/explicit-schema-key) (keys schema))
+                       (meta schema))
+               :left->right (fn [left-obj]
+                              (for-map [[k v] left-obj
+                                        :let [{:keys [left->right]} (or (get key->bijection k)
+                                                                        (throw-bijection-schema-error left-obj))]]
+                                k (left->right v)))
+               :right->left (fn [right-obj]
+                              (for-map [[k v] right-obj
+                                        :let [{:keys [right->left]} (or (get key->bijection k)
+                                                                        (throw-bijection-schema-error right-obj))]]
+                                k (right->left v)))
+               :right (with-meta (map-from-keys (comp :right key->bijection s/explicit-schema-key) (keys schema))
+                        (meta schema))}))]
+    (if-let [[key-schema & more-key-schemas]
+             (seq (filter schema? (keys schema)))]
+      (do
+        (assert (empty? more-key-schemas))
+        (let [key-schema-bijection (walk key-schema bijector)
+              val-schema-bijection (walk (get schema key-schema) bijector)
+
+              {:keys [left left->right right->left right]}
+              (walk-map-with-no-key-schemas (dissoc schema key-schema))
+
+              explicit-keys-on-right (map s/explicit-schema-key (keys right))
+              explicit-keys-on-left (map s/explicit-schema-key (keys left))]
+          {:left
+           (assoc left (:left key-schema-bijection) (:left val-schema-bijection))
+
+           :left->right
+           (fn [left-obj]
+             (-> left-obj
+                 (select-keys explicit-keys-on-left)
+                 (left->right)
+                 (merge (for-map [[k v] (apply dissoc left-obj explicit-keys-on-left)]
+                          ((:left->right key-schema-bijection) k)
+                          ((:left->right val-schema-bijection) v)))))
+
+           :right->left
+           (fn [right-obj]
+             (-> right-obj
+                 (select-keys explicit-keys-on-right)
+                 (right->left)
+                 (merge (for-map [[k v] (apply dissoc right-obj explicit-keys-on-left)]
+                          ((:right->left key-schema-bijection) k)
+                          ((:right->left val-schema-bijection) v)))))
+
+           :right
+           (assoc right (:right key-schema-bijection) (:right val-schema-bijection))}))
+      (walk-map-with-no-key-schemas schema))))
 
 (defmethod walk* clojure.lang.IPersistentVector
   [schema bijector]
@@ -127,7 +163,7 @@
                                   t))))))
    :right right})
 
-(defn ^:private walk
+(defn walk
   [schema bijector]
   (bijector (walk* schema bijector)))
 
@@ -162,8 +198,14 @@
 
   A bijection is the same as the map returned from a transformer."
   [schema transformers]
-  (wrap-top-level-errors
-   (walk schema (transformers->bijector transformers))))
+  (try
+    (wrap-top-level-errors
+     (walk schema (transformers->bijector transformers)))
+    (catch Throwable e
+      (throw (ex-info "Exception while creating schema bijection!"
+                      {:schema schema
+                       :transformers transformers}
+                      e)))))
 
 ;;
 ;; The builtin transformers
@@ -173,16 +215,16 @@
   [m]
   (and (map? m) (not (record? m))))
 
-;; TODO: how should the rest schema play with this?
 (defn transform-keys
   "Given a function for transforming map keys, returns a transformer
-  that transforms keys of map schemas."
+  that transforms keys of map schemas. If a map schema has a
+  key-schema, it will be ignored."
   [func]
   (fn [right]
     (when (non-record-map? right)
-      (assert (not-any? #(satisfies? schema.core/Schema %) (keys right))
-              "General map schemas not supported yet!")
-      (let [bare-keys (map s/explicit-schema-key (keys right))
+      (let [bare-keys (->> (keys right)
+                           (remove schema?)
+                           (map s/explicit-schema-key))
             fk->k (for-map [k bare-keys] (func k) k)
             k->fk (for-map [k bare-keys] k (func k))
             _ (when (not= (count fk->k)
@@ -196,6 +238,22 @@
                                                       (filter #(< 1 (count %)))
                                                       (first))
                                  :type ::bad-input})))
+
+            extra-keys-schema (->> (keys right) (filter schema?) (first))
+
+            ;; I'm not sure if there's a decent use case for having
+            ;; this work; at the moment if we don't have this check,
+            ;; the generative test objects that key-stringifying the
+            ;; map {"*" false, :* false} is ambiguous.
+            _ (when extra-keys-schema
+                (when-let [colliding (seq (filter #(nil? (s/check extra-keys-schema %)) (vals k->fk)))]
+                  (throw (ex-info "Potential collision in transform-keys function!"
+                                  {:schema right
+                                   :func func
+                                   :schema-for-extra-keys extra-keys-schema
+                                   :keys-colliding-with-schema-for-extra-keys colliding
+                                   :type ::bad-input}))))
+
             left (map-keys (fn [k]
                              (cond (keyword? k)
                                    (s/required-key (k->fk k))
@@ -206,18 +264,34 @@
                                    (s/required-key? k)
                                    (s/required-key (k->fk (:k k)))
 
+                                   (schema? k)
+                                   k
+
                                    :else
-                                   (throw (ex-info "Unknown key" {:k k}))))
+                                   (throw (ex-info "Unknown key type" {:k k}))))
                            right)
+
             left->right (fn [left-obj]
-                          (map-keys (fn [k]
-                                      (get-or-throw fk->k k))
+                          (map-keys (fn [fk]
+                                      (if-let [[_ k] (find fk->k fk)]
+                                        k
+                                        (if (and extra-keys-schema
+                                                 (nil? (s/check extra-keys-schema fk)))
+                                          fk
+                                          (throw (ex-info "Disallowed key!"
+                                                          {:schema left :key fk})))))
                                     left-obj))
             right->left (fn [right-obj]
                           (map-keys (fn [k]
-                                      (get-or-throw k->fk k))
+                                      (if-let [[_ fk] (find k->fk k)]
+                                        fk
+                                        (if (and extra-keys-schema
+                                                 (nil? (s/check extra-keys-schema k)))
+                                          k
+                                          (throw (ex-info "Disallowed key!"
+                                                          {:schema right :key k})))))
                                     right-obj))]
-        {:left left
+        {:left (with-meta left (meta right))
          :left->right left->right
          :right->left right->left}))))
 
@@ -230,16 +304,19 @@
      :right->left str}))
 
 (defn allow-extra-keys-on-left
-  "Not technically a bijection anymore I guess."
-  [key-schema right]
-  (when (and (non-record-map? right)
-             (not-any? #(satisfies? s/Schema %) (keys right)))
-    (let [right-keys (map s/explicit-schema-key (keys right))]
-      {:left (assoc right key-schema s/Any)
-       :left->right (fn [left-obj]
-                      (select-keys left-obj right-keys))
-       :right->left identity})))
+  "Returns a transformer that will allow arbitrary extra map keys
+  matching the given schema, and removes them when converting."
+  [key-schema]
+  (fn [right]
+    (when (and (non-record-map? right)
+               (not-any? #(satisfies? s/Schema %) (keys right)))
+      (let [right-keys (map s/explicit-schema-key (keys right))]
+        {:left (assoc right key-schema s/Any)
+         :left->right (fn [left-obj]
+                        (select-keys left-obj right-keys))
+         :right->left identity}))))
 
 (def stringify-keys
-  "A transformer that converts keyword keys of maps into string keys."
+  "A transformer that converts static keyword keys of maps into string
+  keys."
   (transform-keys name))
