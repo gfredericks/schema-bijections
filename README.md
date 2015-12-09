@@ -120,6 +120,9 @@ UserJson
 - Should the conversion functions always do full validation? Should
   that be configurable?
 - Integrating this with prismatic/fnhouse is currently a bit awkward.
+- Does the schema `1.0.0` change from `either` schemas to conditionals
+  make it difficult to do anything generic with them? (i.e., without
+  having to figure out how to "translate" each predicate)
 
 ## License
 
