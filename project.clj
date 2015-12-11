@@ -1,4 +1,4 @@
-(defproject com.gfredericks/schema-bijections "0.1.2"
+(defproject com.gfredericks/schema-bijections "0.1.3-SNAPSHOT"
   :description "A library for bijecting prismatic schemas."
   :url "https://github.com/gfredericks/schema-bijections"
   :license {:name "Eclipse Public License"
