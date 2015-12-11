@@ -1,5 +1,5 @@
 (ns com.gfredericks.schema-bijections
-  (:require [plumbing.core :refer [for-map map-from-keys map-keys]]
+  (:require [plumbing.core :refer [for-map map-from-keys map-from-vals map-keys]]
             [schema.core :as s]))
 
 (def ^:private schema? #(satisfies? s/Schema %))
@@ -320,3 +320,15 @@
   "A transformer that converts static keyword keys of maps into string
   keys."
   (transform-keys name))
+
+(defn stringify-keyword-enums
+  "A transformer that converts (s/enum :foo :bar :baz) to
+  (s/enum \"foo\" \"bar\" \"baz\")."
+  [schema]
+  (when (and (instance? schema.core.EnumSchema schema)
+             (every? keyword? (:vs schema)))
+    (let [left->right (map-from-vals name (:vs schema))
+          right->left (map-from-keys name (:vs schema))]
+      {:left (apply s/enum (keys left->right))
+       :left->right left->right
+       :right->left right->left})))

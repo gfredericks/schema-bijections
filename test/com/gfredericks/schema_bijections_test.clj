@@ -113,7 +113,9 @@
                               Double
                               Long
                               s/Str
-                              s/Uuid])]))
+                              s/Uuid])
+               (gen/let [kws (gen/set gen/keyword {:min-elements 1})]
+                 (apply s/enum kws))]))
 
 (def gen-schema
   ;; have to scale this since recursive-gen's sizing is still out of control
@@ -142,7 +144,8 @@
    (gen/elements [stringify-uuids
                   stringify-keys
                   stringify-bigdecimals
-                  camelize-keys])))
+                  camelize-keys
+                  stringify-keyword-enums])))
 
 (def roundtrip-scenario
   (gen/such-that
