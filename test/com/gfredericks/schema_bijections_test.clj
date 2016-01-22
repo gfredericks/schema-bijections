@@ -121,9 +121,12 @@
   ;; have to scale this since recursive-gen's sizing is still out of control
   (gen/scale #(min % 15)
              (gen/recursive-gen (fn [inner-gen]
-                                  (gen/one-of [;; TODO: fancier sequence schemas
-                                               (gen/let [schema inner-gen]
-                                                 [schema])
+                                  (gen/one-of [(gen/let [[one-schemas [rest-schema]]
+                                                         (gen/tuple (gen/vector inner-gen)
+                                                                    (gen/vector inner-gen 0 1))]
+                                                 (cond-> (mapv #(s/one % "a-schema") one-schemas)
+                                                   rest-schema
+                                                   (conj rest-schema)))
                                                (gen/let [static-keys
                                                          (gen/map gen/keyword inner-gen)
 

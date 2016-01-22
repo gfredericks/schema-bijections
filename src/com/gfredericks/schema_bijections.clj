@@ -91,17 +91,56 @@
            (assoc right (:right key-schema-bijection) (:right val-schema-bijection))}))
       (walk-map-with-no-key-schemas schema))))
 
+(defn ^:private one-schema? [x] (instance? schema.core.One x))
+
 (defmethod walk* clojure.lang.IPersistentVector
   [schema bijector]
-  (assert (and (= 1 (count schema))
-               (satisfies? schema.core/Schema (first schema))
-               (not (instance? schema.core.One (first schema))))
-          "General sequence schemas not implemented yet!")
-  (let [{:keys [left left->right right->left right]} (walk (first schema) bijector)]
-    {:left [left]
-     :left->right #(mapv left->right %)
-     :right->left #(mapv right->left %)
-     :right [right]}))
+  (assert (not-any? #(and (one-schema? %)
+                          (:optional? %))
+                    schema)
+          ;; optional elements make the transformation functions near
+          ;; impossible to implement because there's ambiguity about
+          ;; which schema an element of the sequence is supposed to
+          ;; match
+          "Sequence schemas with optional elements are not supported!")
+  (if (empty? schema)
+    {:left [] :left->right identity :right->left identity :right []}
+    (let [fmap (fn [f ob]
+                 (if (one-schema? ob)
+                   (let [{:keys [left left->right right->left right]}
+                         (f (:schema ob))]
+                     {:left (assoc ob :schema left)
+                      :left->right left->right
+                      :right->left right->left
+                      :right (assoc ob :schema right)})
+                   (f ob)))
+          walked (map #(fmap (fn [schema] (walk schema bijector)) %) schema)
+          min-values (if (one-schema? (last schema))
+                       (count schema)
+                       (dec (count schema)))
+          max-values (if (one-schema? (last schema))
+                       (count schema))
+          transform (fn [value schema transformers]
+                      (let [c (count value)]
+                        (if (< c min-values)
+                          (throw (ex-info "Not enough items in sequence!"
+                                          {:schema schema
+                                           :value value}))
+                          (if (and max-values (< max-values c))
+                            (throw (ex-info "too many items in sequence!"
+                                            {:schema schema
+                                             :value value})))))
+                      (mapv (fn [item transformer]
+                              (transformer item))
+                            value
+                            (concat transformers
+                                    (repeat (last transformers)))))
+          left (mapv :left walked)
+          right (mapv :right walked)]
+      {:left left
+       :left->right #(transform % left (map :left->right walked))
+       :right->left #(transform % right (map :right->left walked))
+       :right right})))
 
 (defmethod walk* schema.core.Maybe
   [schema bijector]
