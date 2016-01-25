@@ -171,3 +171,13 @@
       (s/validate schema x)
       (s/validate left (right->left x))
       (= x (-> x right->left left->right)))))
+
+(deftest extra-keys-test
+  (let [schema {:foo-bar s/Int}
+        {:keys [left left->right right->left]}
+        (schema->bijection schema [(allow-extra-keys-on-left s/Keyword)
+                                   camelize-keys])]
+    (is (s/validate schema {:foo-bar 42}))
+    (is (s/validate left {:fooBar -42 :some "other" :keys "here"}))
+    (is (= {:foo-bar -42} (left->right {:fooBar -42 :some "other" :keys "here"})))
+    (is (= {:fooBar -42} (right->left {:foo-bar -42})))))
