@@ -1,5 +1,6 @@
 (ns com.gfredericks.schema-bijections
   (:require [plumbing.core :refer [for-map map-from-keys map-from-vals map-keys]]
+            [schema.experimental.abstract-map :as sam]
             [schema.core :as s]))
 
 (def ^:private schema? #(satisfies? s/Schema %))
@@ -141,6 +142,23 @@
        :left->right #(transform % left (map :left->right walked))
        :right->left #(transform % right (map :right->left walked))
        :right right})))
+
+(defmethod walk* schema.experimental.abstract_map.AbstractSchema
+  [{:keys [sub-schemas dispatch-key schema] :as abstract} bijector]
+  (let [extensions @sub-schemas]
+    (letfn [(delegate-to-map-impl [transform]
+              (fn [v]
+                (let [kind            (get v dispatch-key)
+                      extended-schema (:extended-schema (get extensions kind {}))
+                      map-schema      (merge schema extended-schema {dispatch-key (s/enum kind)})]
+                  ((transform (walk map-schema bijector)) v))))]
+      {:left        (let [abstract (sam/abstract-map-schema dispatch-key (walk schema bijector))]
+                      (doseq [[k {:keys [extended-schema]}] extensions]
+                        (sam/extend-schema! abstract (walk extended-schema bijector) (gensym) [k]))
+                      abstract)
+       :left->right (delegate-to-map-impl :left->right)
+       :right->left (delegate-to-map-impl :right->left)
+       :right       abstract})))
 
 (defmethod walk* schema.core.Maybe
   [schema bijector]
